@@ -1240,6 +1240,7 @@ const deviceDimensions = {
     'iphone-6.7': { width: 1290, height: 2796 },
     'iphone-6.5': { width: 1284, height: 2778 },
     'iphone-5.5': { width: 1242, height: 2208 },
+    'ipad-13': { width: 2064, height: 2752 },
     'ipad-12.9': { width: 2048, height: 2732 },
     'ipad-11': { width: 1668, height: 2388 },
     'android-phone': { width: 1080, height: 1920 },
@@ -1464,6 +1465,7 @@ async function init() {
         await loadState();
         syncUIWithState();
         updateCanvas();
+        await initFolderSync();
     } catch (e) {
         console.error('Initialization error:', e);
         // Continue with defaults
@@ -1548,6 +1550,11 @@ function saveState() {
         store.put(stateToSave);
     } catch (e) {
         console.error('Error saving state:', e);
+    }
+
+    // Mirror to connected backup folder (debounced, write-only, no-op if not connected)
+    if (typeof scheduleFolderSync === 'function') {
+        scheduleFolderSync();
     }
 }
 
@@ -2033,6 +2040,692 @@ async function duplicateProject(sourceProjectId, customName) {
             };
         };
     });
+}
+
+// =========================================================================
+// Backup / Restore
+// -------------------------------------------------------------------------
+// Read-only against existing IndexedDB. Imports never silently overwrite -
+// conflicts are routed through showImportConflictDialog().
+// =========================================================================
+
+const BACKUP_FORMAT_SINGLE = 'appscreen-project';
+const BACKUP_FORMAT_ALL = 'appscreen-all-projects';
+const BACKUP_FORMAT_VERSION = 1;
+
+// Read one project record from IndexedDB by id (returns null if missing)
+function readProjectFromDB(projectId) {
+    return new Promise((resolve) => {
+        if (!db) { resolve(null); return; }
+        try {
+            const tx = db.transaction([PROJECTS_STORE], 'readonly');
+            const req = tx.objectStore(PROJECTS_STORE).get(projectId);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => resolve(null);
+        } catch (e) {
+            resolve(null);
+        }
+    });
+}
+
+function sanitizeFilename(s) {
+    return String(s || 'project').replace(/[^a-z0-9-_]+/gi, '-').replace(/^-+|-+$/g, '') || 'project';
+}
+
+function downloadBlob(blob, filename) {
+    const link = document.createElement('a');
+    link.download = filename;
+    link.href = URL.createObjectURL(blob);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+// Export only the currently active project
+async function exportCurrentProject() {
+    try {
+        if (!db) {
+            await showAppAlert('Storage is not available. Cannot export.', 'error');
+            return;
+        }
+
+        // Flush in-memory state to IndexedDB so the export is up to date
+        saveState();
+        await new Promise(r => setTimeout(r, 150));
+
+        const projectData = await readProjectFromDB(currentProjectId);
+        if (!projectData) {
+            await showAppAlert('Could not read this project from storage.', 'error');
+            return;
+        }
+        const meta = projects.find(p => p.id === currentProjectId);
+        const backup = {
+            format: BACKUP_FORMAT_SINGLE,
+            version: BACKUP_FORMAT_VERSION,
+            exportedAt: new Date().toISOString(),
+            project: {
+                id: projectData.id,
+                name: meta?.name || 'Untitled Project',
+                screenshotCount: projectData.screenshots?.length || 0,
+                data: projectData
+            }
+        };
+
+        const blob = new Blob([JSON.stringify(backup)], { type: 'application/json' });
+        const filename = `${sanitizeFilename(meta?.name)}.appscreen.json`;
+        downloadBlob(blob, filename);
+    } catch (e) {
+        console.error('Export current project failed:', e);
+        await showAppAlert('Export failed: ' + (e?.message || e), 'error');
+    }
+}
+
+// Export every project in IndexedDB as a single backup file
+async function exportAllProjects() {
+    try {
+        if (!db) {
+            await showAppAlert('Storage is not available. Cannot export.', 'error');
+            return;
+        }
+
+        // Flush current project's in-memory state
+        saveState();
+        await new Promise(r => setTimeout(r, 150));
+
+        const entries = [];
+        for (const meta of projects) {
+            const data = await readProjectFromDB(meta.id);
+            if (!data) continue;
+            entries.push({
+                id: meta.id,
+                name: meta.name,
+                screenshotCount: data.screenshots?.length || 0,
+                data
+            });
+        }
+
+        if (entries.length === 0) {
+            await showAppAlert('No projects found to export.', 'info');
+            return;
+        }
+
+        const backup = {
+            format: BACKUP_FORMAT_ALL,
+            version: BACKUP_FORMAT_VERSION,
+            exportedAt: new Date().toISOString(),
+            currentProjectId,
+            projects: entries
+        };
+
+        const blob = new Blob([JSON.stringify(backup)], { type: 'application/json' });
+        const date = new Date().toISOString().split('T')[0];
+        downloadBlob(blob, `appscreen-backup-${date}.json`);
+    } catch (e) {
+        console.error('Export all projects failed:', e);
+        await showAppAlert('Export failed: ' + (e?.message || e), 'error');
+    }
+}
+
+// Show conflict dialog. Resolves to one of: 'replace', 'new', 'skip', 'cancel'
+function showImportConflictDialog(existingName, incomingName) {
+    return new Promise((resolve) => {
+        const overlay = document.getElementById('import-conflict-modal');
+        const msg = document.getElementById('import-conflict-message');
+        const cancelBtn = document.getElementById('import-conflict-cancel');
+        const skipBtn = document.getElementById('import-conflict-skip');
+        const newBtn = document.getElementById('import-conflict-new');
+        const replaceBtn = document.getElementById('import-conflict-replace');
+
+        msg.textContent = `A project named "${existingName}" already exists with the same ID as the imported "${incomingName}". What would you like to do?`;
+        overlay.className = 'modal-overlay visible';
+
+        const cleanup = (result) => {
+            overlay.classList.remove('visible');
+            cancelBtn.removeEventListener('click', onCancel);
+            skipBtn.removeEventListener('click', onSkip);
+            newBtn.removeEventListener('click', onNew);
+            replaceBtn.removeEventListener('click', onReplace);
+            resolve(result);
+        };
+        const onCancel = () => cleanup('cancel');
+        const onSkip = () => cleanup('skip');
+        const onNew = () => cleanup('new');
+        const onReplace = () => cleanup('replace');
+
+        cancelBtn.addEventListener('click', onCancel);
+        skipBtn.addEventListener('click', onSkip);
+        newBtn.addEventListener('click', onNew);
+        replaceBtn.addEventListener('click', onReplace);
+    });
+}
+
+// Write a single project entry into IndexedDB. Returns:
+//   { status: 'imported', id, name } or
+//   { status: 'skipped' } or
+//   { status: 'cancelled' }
+async function importSingleProjectEntry(entry, defaultMode) {
+    if (!entry || !entry.data) return { status: 'skipped' };
+
+    const existing = projects.find(p => p.id === entry.id);
+    let mode = defaultMode || 'new';
+
+    if (existing) {
+        mode = await showImportConflictDialog(existing.name, entry.name || 'Imported Project');
+        if (mode === 'cancel') return { status: 'cancelled' };
+        if (mode === 'skip') return { status: 'skipped' };
+    } else {
+        mode = 'new-clean';
+    }
+
+    let targetId = entry.id;
+    let targetName = entry.name || 'Imported Project';
+
+    if (mode === 'new') {
+        targetId = 'project_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+        targetName = `${entry.name || 'Imported Project'} (imported)`;
+    }
+
+    const dataToStore = { ...entry.data, id: targetId };
+
+    await new Promise((resolve, reject) => {
+        try {
+            const tx = db.transaction([PROJECTS_STORE], 'readwrite');
+            tx.objectStore(PROJECTS_STORE).put(dataToStore);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        } catch (e) {
+            reject(e);
+        }
+    });
+
+    if (mode === 'replace') {
+        if (existing) {
+            existing.name = targetName;
+            existing.screenshotCount = entry.data.screenshots?.length || 0;
+        }
+    } else {
+        // 'new' or 'new-clean'
+        projects.push({
+            id: targetId,
+            name: targetName,
+            screenshotCount: entry.data.screenshots?.length || 0
+        });
+    }
+    saveProjectsMeta();
+
+    return { status: 'imported', id: targetId, name: targetName };
+}
+
+// Import a backup .json file selected by the user
+async function importProjectFromFile(file) {
+    if (!file) return;
+    if (!db) {
+        await showAppAlert('Storage is not available. Cannot import.', 'error');
+        return;
+    }
+
+    let parsed;
+    try {
+        const text = await file.text();
+        parsed = JSON.parse(text);
+    } catch (e) {
+        await showAppAlert('Could not read backup file. Is it a valid AppScreen .json export?', 'error');
+        return;
+    }
+
+    let entries = [];
+    if (parsed?.format === BACKUP_FORMAT_SINGLE && parsed.project?.data) {
+        entries = [parsed.project];
+    } else if (parsed?.format === BACKUP_FORMAT_ALL && Array.isArray(parsed.projects)) {
+        entries = parsed.projects.filter(p => p && p.data);
+    } else {
+        await showAppAlert('This file is not a recognized AppScreen backup.', 'error');
+        return;
+    }
+
+    if (entries.length === 0) {
+        await showAppAlert('Backup file contains no projects.', 'info');
+        return;
+    }
+
+    let importedCount = 0;
+    let skippedCount = 0;
+    let firstImportedId = null;
+    for (const entry of entries) {
+        const result = await importSingleProjectEntry(entry);
+        if (result.status === 'cancelled') break;
+        if (result.status === 'imported') {
+            importedCount++;
+            if (!firstImportedId) firstImportedId = result.id;
+        } else if (result.status === 'skipped') {
+            skippedCount++;
+        }
+    }
+
+    updateProjectSelector();
+
+    if (importedCount > 0) {
+        // Switch to the first imported project so the user immediately sees their work
+        if (firstImportedId) {
+            await switchProject(firstImportedId);
+        }
+        const msg = skippedCount > 0
+            ? `Imported ${importedCount} project${importedCount !== 1 ? 's' : ''} (${skippedCount} skipped).`
+            : `Imported ${importedCount} project${importedCount !== 1 ? 's' : ''} successfully.`;
+        await showAppAlert(msg, 'success');
+    } else if (skippedCount > 0) {
+        await showAppAlert(`No projects imported (${skippedCount} skipped).`, 'info');
+    }
+}
+
+// =========================================================================
+// Folder auto-sync (File System Access API)
+// -------------------------------------------------------------------------
+// Write-only by design: every saveState() debounces a write of the current
+// project to the connected folder. We never auto-read from the folder; the
+// user must explicitly click "Restore" to pull data back, which then routes
+// through the same conflict dialog as file imports.
+// =========================================================================
+
+const FOLDER_HANDLE_KEY = 'backupFolderHandle';
+let folderSyncHandle = null;          // FileSystemDirectoryHandle when connected
+let folderSyncPermission = 'prompt';  // 'granted' | 'denied' | 'prompt'
+let folderSyncDebounceTimer = null;
+let folderSyncInFlight = false;
+let folderSyncQueued = false;
+let folderSyncLastError = null;
+
+function isFolderSyncSupported() {
+    return typeof window !== 'undefined'
+        && typeof window.showDirectoryPicker === 'function'
+        && typeof window.indexedDB !== 'undefined';
+}
+
+// Persist the directory handle in the meta store so we can reconnect later
+function saveFolderHandleToDB(handle) {
+    if (!db) return;
+    try {
+        const tx = db.transaction([META_STORE], 'readwrite');
+        tx.objectStore(META_STORE).put({ key: FOLDER_HANDLE_KEY, value: handle });
+    } catch (e) {
+        console.warn('Could not persist folder handle:', e);
+    }
+}
+
+function clearFolderHandleInDB() {
+    if (!db) return;
+    try {
+        const tx = db.transaction([META_STORE], 'readwrite');
+        tx.objectStore(META_STORE).delete(FOLDER_HANDLE_KEY);
+    } catch (e) {
+        console.warn('Could not clear folder handle:', e);
+    }
+}
+
+function loadFolderHandleFromDB() {
+    return new Promise((resolve) => {
+        if (!db) { resolve(null); return; }
+        try {
+            const tx = db.transaction([META_STORE], 'readonly');
+            const req = tx.objectStore(META_STORE).get(FOLDER_HANDLE_KEY);
+            req.onsuccess = () => resolve(req.result?.value || null);
+            req.onerror = () => resolve(null);
+        } catch (e) {
+            resolve(null);
+        }
+    });
+}
+
+// Check (read) or request (read+write) permission for the handle
+async function queryFolderPermission(handle, mode = 'readwrite') {
+    if (!handle?.queryPermission) return 'denied';
+    try {
+        return await handle.queryPermission({ mode });
+    } catch {
+        return 'denied';
+    }
+}
+
+async function requestFolderPermission(handle, mode = 'readwrite') {
+    if (!handle?.requestPermission) return 'denied';
+    try {
+        return await handle.requestPermission({ mode });
+    } catch {
+        return 'denied';
+    }
+}
+
+function sanitizeFolderFilename(name) {
+    return String(name || 'project')
+        .replace(/[\/\\:*?"<>|]+/g, '-')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 80) || 'project';
+}
+
+// Write a single project to disk: <folder>/<sanitized-name>.appscreen.json
+async function writeProjectToFolder(projectId, handle) {
+    const projectData = await readProjectFromDB(projectId);
+    if (!projectData) return;
+    const meta = projects.find(p => p.id === projectId);
+
+    const payload = {
+        format: BACKUP_FORMAT_SINGLE,
+        version: BACKUP_FORMAT_VERSION,
+        exportedAt: new Date().toISOString(),
+        project: {
+            id: projectData.id,
+            name: meta?.name || 'Untitled Project',
+            screenshotCount: projectData.screenshots?.length || 0,
+            data: projectData
+        }
+    };
+
+    const filename = `${sanitizeFolderFilename(meta?.name)}.appscreen.json`;
+    const fileHandle = await handle.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(JSON.stringify(payload));
+    await writable.close();
+}
+
+function setFolderSyncStatus(text, kind) {
+    const lastEl = document.getElementById('folder-sync-last');
+    const dotEl = document.getElementById('folder-sync-dot');
+    if (lastEl) {
+        lastEl.textContent = text;
+        lastEl.classList.toggle('is-error', kind === 'error');
+        lastEl.classList.toggle('is-syncing', kind === 'syncing');
+    }
+    if (dotEl) {
+        dotEl.classList.toggle('is-syncing', kind === 'syncing');
+        dotEl.classList.toggle('is-error', kind === 'error');
+    }
+}
+
+function formatRelativeTime(date) {
+    const now = new Date();
+    const diff = (now - date) / 1000;
+    if (diff < 5) return 'just now';
+    if (diff < 60) return `${Math.floor(diff)}s ago`;
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    return date.toLocaleString();
+}
+
+// Auto-sync the current project (called from saveState via debounce)
+async function syncCurrentProjectToFolder() {
+    if (!folderSyncHandle || folderSyncPermission !== 'granted') return;
+    if (folderSyncInFlight) {
+        folderSyncQueued = true;
+        return;
+    }
+    folderSyncInFlight = true;
+    setFolderSyncStatus('Syncing…', 'syncing');
+    try {
+        await writeProjectToFolder(currentProjectId, folderSyncHandle);
+        folderSyncLastError = null;
+        setFolderSyncStatus(`Synced ${formatRelativeTime(new Date())}`, 'ok');
+    } catch (e) {
+        console.error('Folder sync failed:', e);
+        folderSyncLastError = e?.message || String(e);
+        // If permission was revoked mid-flight, downgrade UI
+        const perm = await queryFolderPermission(folderSyncHandle);
+        if (perm !== 'granted') {
+            folderSyncPermission = perm;
+            renderFolderSyncUI();
+        } else {
+            setFolderSyncStatus('Sync failed — ' + folderSyncLastError, 'error');
+        }
+    } finally {
+        folderSyncInFlight = false;
+        if (folderSyncQueued) {
+            folderSyncQueued = false;
+            scheduleFolderSync();
+        }
+    }
+}
+
+function scheduleFolderSync() {
+    if (!folderSyncHandle || folderSyncPermission !== 'granted') return;
+    if (folderSyncDebounceTimer) clearTimeout(folderSyncDebounceTimer);
+    folderSyncDebounceTimer = setTimeout(() => {
+        folderSyncDebounceTimer = null;
+        syncCurrentProjectToFolder();
+    }, 1500);
+}
+
+// "Sync All Now" - one-time full sync of every project to the folder
+async function syncAllProjectsToFolder() {
+    if (!folderSyncHandle || folderSyncPermission !== 'granted') return;
+    saveState();
+    await new Promise(r => setTimeout(r, 150));
+
+    setFolderSyncStatus('Syncing all projects…', 'syncing');
+    try {
+        let n = 0;
+        for (const meta of projects) {
+            await writeProjectToFolder(meta.id, folderSyncHandle);
+            n++;
+        }
+        setFolderSyncStatus(`Synced ${n} project${n !== 1 ? 's' : ''} just now`, 'ok');
+    } catch (e) {
+        console.error('Sync-all failed:', e);
+        setFolderSyncStatus('Sync failed — ' + (e?.message || e), 'error');
+    }
+}
+
+// Restore from folder: scan for *.appscreen.json, parse, run through conflict dialog
+async function restoreFromFolder() {
+    if (!folderSyncHandle || folderSyncPermission !== 'granted') {
+        await showAppAlert('No folder is connected.', 'info');
+        return;
+    }
+
+    let importedCount = 0;
+    let skippedCount = 0;
+    let firstImportedId = null;
+    let cancelled = false;
+
+    try {
+        // Iterate top-level files
+        const entries = [];
+        for await (const [name, fileHandle] of folderSyncHandle.entries()) {
+            if (fileHandle.kind !== 'file') continue;
+            if (!name.toLowerCase().endsWith('.json')) continue;
+            entries.push({ name, handle: fileHandle });
+        }
+        if (entries.length === 0) {
+            await showAppAlert('No backup files found in the connected folder.', 'info');
+            return;
+        }
+
+        for (const { name, handle } of entries) {
+            let parsed;
+            try {
+                const file = await handle.getFile();
+                const text = await file.text();
+                parsed = JSON.parse(text);
+            } catch (e) {
+                console.warn(`Skipping unreadable ${name}:`, e);
+                continue;
+            }
+
+            // Accept both single-project and all-projects formats
+            let projectEntries = [];
+            if (parsed?.format === BACKUP_FORMAT_SINGLE && parsed.project?.data) {
+                projectEntries = [parsed.project];
+            } else if (parsed?.format === BACKUP_FORMAT_ALL && Array.isArray(parsed.projects)) {
+                projectEntries = parsed.projects.filter(p => p?.data);
+            } else {
+                continue;
+            }
+
+            for (const entry of projectEntries) {
+                const result = await importSingleProjectEntry(entry);
+                if (result.status === 'cancelled') {
+                    cancelled = true;
+                    break;
+                }
+                if (result.status === 'imported') {
+                    importedCount++;
+                    if (!firstImportedId) firstImportedId = result.id;
+                } else if (result.status === 'skipped') {
+                    skippedCount++;
+                }
+            }
+            if (cancelled) break;
+        }
+    } catch (e) {
+        console.error('Restore failed:', e);
+        await showAppAlert('Restore failed: ' + (e?.message || e), 'error');
+        return;
+    }
+
+    updateProjectSelector();
+
+    if (importedCount > 0) {
+        if (firstImportedId) {
+            await switchProject(firstImportedId);
+        }
+        const msg = skippedCount > 0
+            ? `Restored ${importedCount} project${importedCount !== 1 ? 's' : ''} from folder (${skippedCount} skipped).`
+            : `Restored ${importedCount} project${importedCount !== 1 ? 's' : ''} from folder.`;
+        await showAppAlert(msg, 'success');
+    } else if (skippedCount > 0) {
+        await showAppAlert(`No projects restored (${skippedCount} skipped).`, 'info');
+    } else if (!cancelled) {
+        await showAppAlert('No projects found in folder.', 'info');
+    }
+}
+
+// Top-level: prompt the user to pick a folder
+async function connectBackupFolder() {
+    if (!isFolderSyncSupported()) {
+        await showAppAlert('Folder auto-backup is not supported in this browser.', 'error');
+        return;
+    }
+    try {
+        const handle = await window.showDirectoryPicker({ mode: 'readwrite', id: 'appscreen-backup' });
+        const perm = await requestFolderPermission(handle, 'readwrite');
+        if (perm !== 'granted') {
+            await showAppAlert('Folder access was not granted. Auto-backup will not run.', 'error');
+            return;
+        }
+        folderSyncHandle = handle;
+        folderSyncPermission = 'granted';
+        saveFolderHandleToDB(handle);
+        renderFolderSyncUI();
+        // Trigger an immediate first sync so the user sees something happen
+        await syncCurrentProjectToFolder();
+    } catch (e) {
+        if (e?.name === 'AbortError') return; // user cancelled picker
+        console.error('Connect folder failed:', e);
+        await showAppAlert('Could not connect folder: ' + (e?.message || e), 'error');
+    }
+}
+
+async function disconnectBackupFolder() {
+    const ok = await showAppConfirm(
+        'Disconnect the backup folder? Auto-saving to disk will stop. The files already on disk will remain.',
+        'Disconnect',
+        'Cancel'
+    );
+    if (!ok) return;
+    folderSyncHandle = null;
+    folderSyncPermission = 'prompt';
+    folderSyncLastError = null;
+    clearFolderHandleInDB();
+    renderFolderSyncUI();
+}
+
+async function regrantFolderPermission() {
+    if (!folderSyncHandle) return;
+    const perm = await requestFolderPermission(folderSyncHandle, 'readwrite');
+    folderSyncPermission = perm;
+    renderFolderSyncUI();
+    if (perm === 'granted') {
+        await syncCurrentProjectToFolder();
+    }
+}
+
+async function forgetFolder() {
+    folderSyncHandle = null;
+    folderSyncPermission = 'prompt';
+    clearFolderHandleInDB();
+    renderFolderSyncUI();
+}
+
+// Render the folder-sync section based on current state
+function renderFolderSyncUI() {
+    const unsupportedEl = document.getElementById('folder-sync-unsupported');
+    const connectBtn = document.getElementById('folder-sync-connect-btn');
+    const connectedEl = document.getElementById('folder-sync-connected');
+    const needsPermEl = document.getElementById('folder-sync-needs-permission');
+    const statusPill = document.getElementById('folder-sync-status-pill');
+    const nameEl = document.getElementById('folder-sync-name');
+    const namePendingEl = document.getElementById('folder-sync-name-pending');
+
+    if (!unsupportedEl || !connectBtn || !connectedEl || !needsPermEl) return;
+
+    // Hide all states first
+    unsupportedEl.hidden = true;
+    connectBtn.hidden = true;
+    connectedEl.hidden = true;
+    needsPermEl.hidden = true;
+
+    if (!isFolderSyncSupported()) {
+        unsupportedEl.hidden = false;
+        if (statusPill) {
+            statusPill.textContent = 'Not available';
+            statusPill.className = 'backup-group-hint';
+        }
+        return;
+    }
+
+    if (!folderSyncHandle) {
+        connectBtn.hidden = false;
+        if (statusPill) {
+            statusPill.textContent = 'Not connected';
+            statusPill.className = 'backup-group-hint';
+        }
+        return;
+    }
+
+    if (folderSyncPermission === 'granted') {
+        connectedEl.hidden = false;
+        if (nameEl) nameEl.textContent = folderSyncHandle.name || 'Backup folder';
+        if (statusPill) {
+            statusPill.textContent = 'Auto-saving';
+            statusPill.className = 'backup-group-hint is-connected';
+        }
+    } else {
+        needsPermEl.hidden = false;
+        if (namePendingEl) namePendingEl.textContent = folderSyncHandle.name || 'Backup folder';
+        if (statusPill) {
+            statusPill.textContent = 'Permission needed';
+            statusPill.className = 'backup-group-hint is-warn';
+        }
+    }
+}
+
+// Load saved handle on startup (call from init)
+async function initFolderSync() {
+    if (!isFolderSyncSupported()) {
+        renderFolderSyncUI();
+        return;
+    }
+    const handle = await loadFolderHandleFromDB();
+    if (!handle) {
+        renderFolderSyncUI();
+        return;
+    }
+    folderSyncHandle = handle;
+    // Browsers require a user gesture to bump permission back to 'granted', so
+    // we only QUERY here. If still granted from a prior session we can resume
+    // silently; otherwise the user sees the "Re-grant Access" prompt.
+    folderSyncPermission = await queryFolderPermission(handle, 'readwrite');
+    renderFolderSyncUI();
 }
 
 function duplicateScreenshot(index) {
@@ -3158,27 +3851,27 @@ function updatePopoutProperties() {
 
     // Crop region
     document.getElementById('popout-crop-x').value = p.cropX;
-    document.getElementById('popout-crop-x-value').textContent = formatValue(p.cropX) + '%';
+    document.getElementById('popout-crop-x-value').value = formatValue(p.cropX);
     document.getElementById('popout-crop-y').value = p.cropY;
-    document.getElementById('popout-crop-y-value').textContent = formatValue(p.cropY) + '%';
+    document.getElementById('popout-crop-y-value').value = formatValue(p.cropY);
     document.getElementById('popout-crop-width').value = p.cropWidth;
-    document.getElementById('popout-crop-width-value').textContent = formatValue(p.cropWidth) + '%';
+    document.getElementById('popout-crop-width-value').value = formatValue(p.cropWidth);
     document.getElementById('popout-crop-height').value = p.cropHeight;
-    document.getElementById('popout-crop-height-value').textContent = formatValue(p.cropHeight) + '%';
+    document.getElementById('popout-crop-height-value').value = formatValue(p.cropHeight);
 
     // Display
     document.getElementById('popout-x').value = p.x;
-    document.getElementById('popout-x-value').textContent = formatValue(p.x) + '%';
+    document.getElementById('popout-x-value').value = formatValue(p.x);
     document.getElementById('popout-y').value = p.y;
-    document.getElementById('popout-y-value').textContent = formatValue(p.y) + '%';
+    document.getElementById('popout-y-value').value = formatValue(p.y);
     document.getElementById('popout-width').value = p.width;
-    document.getElementById('popout-width-value').textContent = formatValue(p.width) + '%';
+    document.getElementById('popout-width-value').value = formatValue(p.width);
     document.getElementById('popout-rotation').value = p.rotation;
-    document.getElementById('popout-rotation-value').textContent = formatValue(p.rotation) + '°';
+    document.getElementById('popout-rotation-value').value = formatValue(p.rotation);
     document.getElementById('popout-opacity').value = p.opacity;
-    document.getElementById('popout-opacity-value').textContent = formatValue(p.opacity) + '%';
+    document.getElementById('popout-opacity-value').value = formatValue(p.opacity);
     document.getElementById('popout-corner-radius').value = p.cornerRadius;
-    document.getElementById('popout-corner-radius-value').textContent = formatValue(p.cornerRadius) + 'px';
+    document.getElementById('popout-corner-radius-value').value = formatValue(p.cornerRadius);
 
     // Shadow
     const shadow = p.shadow || { enabled: false, color: '#000000', blur: 30, opacity: 40, x: 0, y: 15 };
@@ -3189,13 +3882,13 @@ function updatePopoutProperties() {
     document.getElementById('popout-shadow-color').value = shadow.color;
     document.getElementById('popout-shadow-color-hex').value = shadow.color;
     document.getElementById('popout-shadow-blur').value = shadow.blur;
-    document.getElementById('popout-shadow-blur-value').textContent = formatValue(shadow.blur) + 'px';
+    document.getElementById('popout-shadow-blur-value').value = formatValue(shadow.blur);
     document.getElementById('popout-shadow-opacity').value = shadow.opacity;
-    document.getElementById('popout-shadow-opacity-value').textContent = formatValue(shadow.opacity) + '%';
+    document.getElementById('popout-shadow-opacity-value').value = formatValue(shadow.opacity);
     document.getElementById('popout-shadow-x').value = shadow.x;
-    document.getElementById('popout-shadow-x-value').textContent = formatValue(shadow.x) + 'px';
+    document.getElementById('popout-shadow-x-value').value = formatValue(shadow.x);
     document.getElementById('popout-shadow-y').value = shadow.y;
-    document.getElementById('popout-shadow-y-value').textContent = formatValue(shadow.y) + 'px';
+    document.getElementById('popout-shadow-y-value').value = formatValue(shadow.y);
 
     // Border
     const border = p.border || { enabled: false, color: '#ffffff', width: 3, opacity: 100 };
@@ -3206,9 +3899,9 @@ function updatePopoutProperties() {
     document.getElementById('popout-border-color').value = border.color;
     document.getElementById('popout-border-color-hex').value = border.color;
     document.getElementById('popout-border-width').value = border.width;
-    document.getElementById('popout-border-width-value').textContent = formatValue(border.width) + 'px';
+    document.getElementById('popout-border-width-value').value = formatValue(border.width);
     document.getElementById('popout-border-opacity').value = border.opacity;
-    document.getElementById('popout-border-opacity-value').textContent = formatValue(border.opacity) + '%';
+    document.getElementById('popout-border-opacity-value').value = formatValue(border.opacity);
 
     // Update crop preview
     updateCropPreview();
@@ -3476,10 +4169,27 @@ function setupPopoutEventListeners() {
         if (!input) return;
         input.addEventListener('input', () => {
             const val = parseFloat(input.value);
-            if (valueEl) valueEl.textContent = formatValue(val) + suffix;
+            if (valueEl) valueEl.value = formatValue(val);
             if (selectedPopoutId) setPopoutProperty(selectedPopoutId, key, val);
             if (key.startsWith('crop')) updateCropPreview();
         });
+        if (valueEl) {
+            valueEl.addEventListener('input', () => {
+                let val = parseFloat(valueEl.value);
+                if (isNaN(val)) return;
+                val = Math.max(parseFloat(input.min), Math.min(parseFloat(input.max), val));
+                input.value = val;
+                if (selectedPopoutId) setPopoutProperty(selectedPopoutId, key, val);
+                if (key.startsWith('crop')) updateCropPreview();
+            });
+            valueEl.addEventListener('blur', () => {
+                let val = parseFloat(valueEl.value);
+                if (isNaN(val)) val = parseFloat(input.value);
+                val = Math.max(parseFloat(input.min), Math.min(parseFloat(input.max), val));
+                valueEl.value = formatValue(val);
+                input.value = val;
+            });
+        }
     };
 
     bindPopoutSlider('popout-crop-x', 'cropX', '%');
@@ -3514,9 +4224,28 @@ function setupPopoutEventListeners() {
             const p = getSelectedPopout();
             if (!p) return;
             p.shadow[prop] = parseFloat(input.value);
-            if (valEl) valEl.textContent = formatValue(parseFloat(input.value)) + suffix;
+            if (valEl) valEl.value = formatValue(parseFloat(input.value));
             updateCanvas();
         });
+        if (valEl) {
+            valEl.addEventListener('input', () => {
+                const p = getSelectedPopout();
+                if (!p) return;
+                let val = parseFloat(valEl.value);
+                if (isNaN(val)) return;
+                val = Math.max(parseFloat(input.min), Math.min(parseFloat(input.max), val));
+                input.value = val;
+                p.shadow[prop] = val;
+                updateCanvas();
+            });
+            valEl.addEventListener('blur', () => {
+                let val = parseFloat(valEl.value);
+                if (isNaN(val)) val = parseFloat(input.value);
+                val = Math.max(parseFloat(input.min), Math.min(parseFloat(input.max), val));
+                valEl.value = formatValue(val);
+                input.value = val;
+            });
+        }
     };
     bindPopoutShadow('popout-shadow-blur', 'blur', 'px');
     bindPopoutShadow('popout-shadow-opacity', 'opacity', '%');
@@ -3562,9 +4291,28 @@ function setupPopoutEventListeners() {
             const p = getSelectedPopout();
             if (!p) return;
             p.border[prop] = parseFloat(input.value);
-            if (valEl) valEl.textContent = formatValue(parseFloat(input.value)) + suffix;
+            if (valEl) valEl.value = formatValue(parseFloat(input.value));
             updateCanvas();
         });
+        if (valEl) {
+            valEl.addEventListener('input', () => {
+                const p = getSelectedPopout();
+                if (!p) return;
+                let val = parseFloat(valEl.value);
+                if (isNaN(val)) return;
+                val = Math.max(parseFloat(input.min), Math.min(parseFloat(input.max), val));
+                input.value = val;
+                p.border[prop] = val;
+                updateCanvas();
+            });
+            valEl.addEventListener('blur', () => {
+                let val = parseFloat(valEl.value);
+                if (isNaN(val)) val = parseFloat(input.value);
+                val = Math.max(parseFloat(input.min), Math.min(parseFloat(input.max), val));
+                valEl.value = formatValue(val);
+                input.value = val;
+            });
+        }
     };
     bindPopoutBorder('popout-border-width', 'width', 'px');
     bindPopoutBorder('popout-border-opacity', 'opacity', '%');
@@ -3966,6 +4714,85 @@ function setupEventListeners() {
 
     document.getElementById('settings-modal-save').addEventListener('click', () => {
         saveSettings();
+    });
+
+    // Settings tab switching
+    const settingsTabs = document.querySelectorAll('.settings-tab');
+    const settingsPanels = document.querySelectorAll('.settings-tab-panel');
+    const settingsPanelTitle = document.getElementById('settings-panel-title');
+    const tabTitles = {
+        translation: 'Translation',
+        appearance: 'Appearance',
+        backup: 'Data & Backup'
+    };
+    settingsTabs.forEach(tab => {
+        tab.addEventListener('click', () => {
+            const target = tab.dataset.tab;
+            settingsTabs.forEach(t => {
+                const isActive = t === tab;
+                t.classList.toggle('active', isActive);
+                t.setAttribute('aria-selected', isActive ? 'true' : 'false');
+            });
+            settingsPanels.forEach(p => {
+                p.classList.toggle('active', p.dataset.panel === target);
+            });
+            if (settingsPanelTitle && tabTitles[target]) {
+                settingsPanelTitle.textContent = tabTitles[target];
+            }
+            // Refresh stats and folder-sync state when switching to backup tab
+            if (target === 'backup') {
+                updateBackupStats();
+                renderFolderSyncUI();
+            }
+        });
+    });
+
+    // Data & Backup buttons
+    const exportAllBtn = document.getElementById('backup-export-all-btn');
+    if (exportAllBtn) {
+        exportAllBtn.addEventListener('click', async () => {
+            await exportAllProjects();
+        });
+    }
+    const exportCurrentBtn = document.getElementById('backup-export-current-btn');
+    if (exportCurrentBtn) {
+        exportCurrentBtn.addEventListener('click', async () => {
+            await exportCurrentProject();
+        });
+    }
+    const importBtn = document.getElementById('backup-import-btn');
+    const importInput = document.getElementById('backup-import-input');
+    if (importBtn && importInput) {
+        importBtn.addEventListener('click', () => {
+            importInput.value = ''; // allow re-selecting the same file
+            importInput.click();
+        });
+        importInput.addEventListener('change', async (e) => {
+            const file = e.target.files?.[0];
+            if (file) {
+                await importProjectFromFile(file);
+            }
+        });
+    }
+
+    // Folder auto-sync buttons
+    document.getElementById('folder-sync-connect-btn')?.addEventListener('click', async () => {
+        await connectBackupFolder();
+    });
+    document.getElementById('folder-sync-disconnect-btn')?.addEventListener('click', async () => {
+        await disconnectBackupFolder();
+    });
+    document.getElementById('folder-sync-now-btn')?.addEventListener('click', async () => {
+        await syncAllProjectsToFolder();
+    });
+    document.getElementById('folder-sync-restore-btn')?.addEventListener('click', async () => {
+        await restoreFromFolder();
+    });
+    document.getElementById('folder-sync-regrant-btn')?.addEventListener('click', async () => {
+        await regrantFolderPermission();
+    });
+    document.getElementById('folder-sync-forget-btn')?.addEventListener('click', async () => {
+        await forgetFolder();
     });
 
     // Theme selector buttons
@@ -5774,7 +6601,69 @@ function openSettingsModal() {
         btn.classList.toggle('active', btn.dataset.theme === savedTheme);
     });
 
+    // Reset to the Translation tab whenever opening (predictable entry point)
+    const allTabs = document.querySelectorAll('.settings-tab');
+    const allPanels = document.querySelectorAll('.settings-tab-panel');
+    allTabs.forEach(t => {
+        const isFirst = t.dataset.tab === 'translation';
+        t.classList.toggle('active', isFirst);
+        t.setAttribute('aria-selected', isFirst ? 'true' : 'false');
+    });
+    allPanels.forEach(p => {
+        p.classList.toggle('active', p.dataset.panel === 'translation');
+    });
+    const panelTitleEl = document.getElementById('settings-panel-title');
+    if (panelTitleEl) panelTitleEl.textContent = 'Translation';
+
+    // Pre-fetch backup stats so they're ready when the user navigates to that tab
+    updateBackupStats();
+    // Sync folder-sync UI with current state
+    renderFolderSyncUI();
+
     document.getElementById('settings-modal').classList.add('visible');
+}
+
+// Populate the Data & Backup stats row (projects / screenshots / storage)
+async function updateBackupStats() {
+    const projectsEl = document.getElementById('backup-stat-projects');
+    const screenshotsEl = document.getElementById('backup-stat-screenshots');
+    const sizeEl = document.getElementById('backup-stat-size');
+    if (!projectsEl || !screenshotsEl || !sizeEl) return;
+
+    projectsEl.textContent = projects.length;
+
+    let totalScreenshots = 0;
+    for (const p of projects) {
+        if (p.id === currentProjectId) {
+            totalScreenshots += state.screenshots.length;
+        } else {
+            totalScreenshots += p.screenshotCount || 0;
+        }
+    }
+    screenshotsEl.textContent = totalScreenshots;
+
+    // Best-effort storage estimate
+    if (navigator.storage && typeof navigator.storage.estimate === 'function') {
+        try {
+            const est = await navigator.storage.estimate();
+            const bytes = est.usage || 0;
+            sizeEl.textContent = formatBytes(bytes);
+        } catch {
+            sizeEl.textContent = '—';
+        }
+    } else {
+        sizeEl.textContent = '—';
+    }
+}
+
+function formatBytes(bytes) {
+    if (!bytes || bytes < 1024) return `${bytes || 0} B`;
+    const kb = bytes / 1024;
+    if (kb < 1024) return `${kb.toFixed(1)} KB`;
+    const mb = kb / 1024;
+    if (mb < 1024) return `${mb.toFixed(1)} MB`;
+    const gb = mb / 1024;
+    return `${gb.toFixed(2)} GB`;
 }
 
 function updateProviderSection(provider) {
@@ -6738,15 +7627,27 @@ function getCanvasDimensions() {
     return deviceDimensions[state.outputDevice];
 }
 
+// Calculate max preview dimensions that fit 3 canvases in the available space
+function getPreviewMaxDimensions(dims) {
+    const centerCol = document.querySelector('.preview-strip')?.parentElement;
+    const availableWidth = centerCol ? centerCol.clientWidth : 800;
+    const gap = 10;
+    // Fit 3 canvases (main + 2 sides) with gaps in the available width
+    // Main takes ~50% weight, sides are slightly smaller but same scale
+    const maxPerCanvas = (availableWidth - gap * 4) / 3;
+    const maxWidth = Math.min(400, Math.max(200, maxPerCanvas));
+    const maxHeight = 700;
+    return { maxWidth, maxHeight };
+}
+
 function updateCanvas() {
     saveState(); // Persist state on every update
     const dims = getCanvasDimensions();
     canvas.width = dims.width;
     canvas.height = dims.height;
 
-    // Scale for preview
-    const maxPreviewWidth = 400;
-    const maxPreviewHeight = 700;
+    // Scale for preview - adapt to available container width
+    const { maxWidth: maxPreviewWidth, maxHeight: maxPreviewHeight } = getPreviewMaxDimensions(dims);
     const scale = Math.min(maxPreviewWidth / dims.width, maxPreviewHeight / dims.height);
     canvas.style.width = (dims.width * scale) + 'px';
     canvas.style.height = (dims.height * scale) + 'px';
@@ -6798,9 +7699,8 @@ function updateCanvas() {
 
 function updateSidePreviews() {
     const dims = getCanvasDimensions();
-    // Same scale as main preview
-    const maxPreviewWidth = 400;
-    const maxPreviewHeight = 700;
+    // Same scale as main preview - adapt to available space
+    const { maxWidth: maxPreviewWidth, maxHeight: maxPreviewHeight } = getPreviewMaxDimensions(dims);
     const previewScale = Math.min(maxPreviewWidth / dims.width, maxPreviewHeight / dims.height);
 
     // Initialize Three.js if any screenshot uses 3D mode (needed for side previews)
@@ -6889,8 +7789,7 @@ function slideToScreenshot(newIndex, direction) {
     previewStrip.classList.add('sliding');
 
     const dims = getCanvasDimensions();
-    const maxPreviewWidth = 400;
-    const maxPreviewHeight = 700;
+    const { maxWidth: maxPreviewWidth, maxHeight: maxPreviewHeight } = getPreviewMaxDimensions(dims);
     const previewScale = Math.min(maxPreviewWidth / dims.width, maxPreviewHeight / dims.height);
     const slideDistance = dims.width * previewScale + 10; // canvas width + gap
 
